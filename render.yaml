@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: facebook-automation
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: PYTHON_ENV
+        value: production
+      - key: PORT
+        fromService:
+          type: web
+          name: facebook-automation
+          property: port
+    autoDeploy: false
