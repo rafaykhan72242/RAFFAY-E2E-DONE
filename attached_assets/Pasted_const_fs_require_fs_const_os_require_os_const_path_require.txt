@@ -1,1 +1,847 @@
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const puppeteer = require('puppeteer');
+const express = require('express');
+const cors = require('cors');
 
+// File paths
+const COOKIES_PATH = path.join(__dirname, 'cookies.json');
+const TIME_PATH = path.join(__dirname, 'time.txt');
+const HATERS_NAME_PATH = path.join(__dirname, 'hatersname.txt');
+const CONVO_PATH = path.join(__dirname, 'convo.txt');
+const MESSAGES_PATH = path.join(__dirname, 'NP.txt');
+
+let activeProcesses = {};
+let messageRotationIndex = 0;
+
+// Render-specific adjustments
+function isRenderEnvironment() {
+  return process.env.RENDER || process.env.RENDER_SERVICE_ID || false;
+}
+
+function checkVPSOnly() {
+  // For Render, always return true since we're in a cloud environment
+  if (isRenderEnvironment()) return true;
+
+  // For other environments, use original checks
+  if (os.platform() !== 'linux') return false;
+  if (process.env.DISPLAY && !process.env.REPL_ID) return false;
+  if (!fs.existsSync(path.join(__dirname, 'etc', 'vps_only'))) return false;
+  return true;
+}
+
+if (!checkVPSOnly()) {
+  console.error('⛔ This script can run only on VPS environment.');
+  process.exit(1);
+}
+
+function performE2EESimulatedHandshake(process_id) {
+  const keyPath = path.join(__dirname, 'etc', 'e2ee_key');
+  if (fs.existsSync(keyPath)) {
+    console.log(`[${process_id}] 🔐 E2EE handshake simulated: key found (${keyPath}).`);
+    return true;
+  } else {
+    console.warn(`[${process_id}] ⚠️ E2EE handshake simulated: key missing -> creating dummy key for Render.`);
+    // For Render, create dummy key if doesn't exist
+    try {
+      if (!fs.existsSync(path.dirname(keyPath))) {
+        fs.mkdirSync(path.dirname(keyPath), { recursive: true });
+      }
+      fs.writeFileSync(keyPath, 'dummy-key-for-render-environment');
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+}
+
+function safeReadFileTrim(filePath) {
+  try {
+    if (!filePath) return '';
+    if (!fs.existsSync(filePath)) return '';
+    return fs.readFileSync(filePath, 'utf8').split('\n').filter(Boolean).map(l => l.trim()).join(' ');
+  } catch (e) {
+    return '';
+  }
+}
+
+function readConfigFromFiles() {
+  try {
+    // Read cookies from cookies.json
+    let cookies = '';
+    if (fs.existsSync(COOKIES_PATH)) {
+      const cookiesData = JSON.parse(fs.readFileSync(COOKIES_PATH, 'utf8'));
+      cookies = cookiesData.facebook_cookies || '';
+    }
+
+    // Read delay time from time.txt
+    let delay = '30'; // Increased default delay for Render
+    if (fs.existsSync(TIME_PATH)) {
+      delay = fs.readFileSync(TIME_PATH, 'utf8').trim() || '30';
+    }
+
+    // Read target name from hatersname.txt
+    let hatersName = '';
+    if (fs.existsSync(HATERS_NAME_PATH)) {
+      hatersName = fs.readFileSync(HATERS_NAME_PATH, 'utf8').trim();
+    }
+
+    // Read chat_id from convo.txt
+    let chatId = '';
+    if (fs.existsSync(CONVO_PATH)) {
+      chatId = fs.readFileSync(CONVO_PATH, 'utf8').trim();
+    }
+
+    // Read messages from NP.txt
+    let messages = ['Hello! Default message from Render'];
+    if (fs.existsSync(MESSAGES_PATH)) {
+      const messagesContent = fs.readFileSync(MESSAGES_PATH, 'utf8');
+      messages = messagesContent.split('\n').filter(line => line.trim()).map(line => line.trim());
+    }
+
+    return {
+      cookies,
+      delay,
+      hatersName,
+      chatId,
+      messages
+    };
+  } catch (error) {
+    console.error(`Error reading config files: ${error.message}`);
+    return {
+      cookies: '',
+      delay: '30',
+      hatersName: '',
+      chatId: '',
+      messages: ['Hello! Default message from Render']
+    };
+  }
+}
+
+function getNextMessage(messages) {
+  if (!messages || messages.length === 0) {
+    return 'Hello! Default message from Render';
+  }
+
+  const message = messages[messageRotationIndex % messages.length];
+  messageRotationIndex++;
+  return message;
+}
+
+// Enhanced message input finder for Facebook
+async function findMessageInput(page, process_id) {
+  console.log(`[🔍] ${process_id}: Finding message input...`);
+
+  // Wait for page to fully load
+  await new Promise(resolve => setTimeout(resolve, 5000));
+
+  // Comprehensive list of selectors for Facebook message input (2024 updated)
+  const messageInputSelectors = [
+    // New Facebook Messenger selectors (2024)
+    'div[contenteditable="true"][role="textbox"]',
+    'div[contenteditable="true"][data-lexical-editor="true"]',
+    'div[aria-label*="message" i][contenteditable="true"]',
+    'div[aria-label*="Message" i][contenteditable="true"]',
+    'div[aria-label*="Type" i][contenteditable="true"]',
+    'div[aria-label*="Write" i][contenteditable="true"]',
+    'div[aria-label*="Send" i][contenteditable="true"]',
+
+    // Generic contenteditable selectors
+    'div[contenteditable="true"][spellcheck="true"]',
+    'div[contenteditable="true"][aria-multiline="true"]',
+    'div[contenteditable="true"]:not([aria-hidden="true"])',
+
+    // Fallback selectors
+    '[role="textbox"][contenteditable="true"]',
+    '[aria-label="Message"][contenteditable="true"]',
+    '[aria-label="Type a message"][contenteditable="true"]',
+    '[aria-label="Write a message..."][contenteditable="true"]',
+    '[role="combobox"][contenteditable="true"]',
+    '.notranslate[contenteditable="true"]',
+
+    // Mobile Facebook selectors
+    'textarea[placeholder*="message" i]',
+    'textarea[placeholder*="Message" i]',
+    'textarea[placeholder*="Type" i]',
+    'input[placeholder*="message" i]',
+    'input[placeholder*="Message" i]',
+
+    // Last resort - any contenteditable
+    '[contenteditable="true"]'
+  ];
+
+  // Try each selector with enhanced checking
+  for (const selector of messageInputSelectors) {
+    try {
+      console.log(`[🔍] ${process_id}: Trying selector: ${selector}`);
+
+      const elements = await page.$$(selector);
+
+      for (const element of elements) {
+        try {
+          // Check if element is visible and interactable
+          const isVisible = await element.isIntersectingViewport();
+          const boundingBox = await element.boundingBox();
+
+          if (isVisible && boundingBox && boundingBox.width > 0 && boundingBox.height > 0) {
+            // Additional check - try to focus the element
+            await element.focus();
+            await new Promise(resolve => setTimeout(resolve, 1000));
+
+            // Check if we can type in it
+            const isEditable = await element.evaluate(el => {
+              return el.contentEditable === 'true' || el.tagName === 'TEXTAREA' || el.tagName === 'INPUT';
+            });
+
+            if (isEditable) {
+              console.log(`[✅] ${process_id}: Found working message input with: ${selector}`);
+              return element;
+            }
+          }
+        } catch (e) {
+          continue;
+        }
+      }
+    } catch (e) {
+      console.log(`[❌] ${process_id}: Selector failed: ${selector}`);
+      continue;
+    }
+  }
+
+  // Last attempt - try to click on conversation area to activate input
+  console.log(`[🔄] ${process_id}: Trying to activate message input by clicking...`);
+  try {
+    // Click on the conversation area
+    await page.click('body');
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
+    // Try pressing Tab to focus message input
+    await page.keyboard.press('Tab');
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    // Try the selectors again
+    for (const selector of messageInputSelectors.slice(0, 10)) {
+      try {
+        const element = await page.$(selector);
+        if (element) {
+          const isVisible = await element.isIntersectingViewport();
+          if (isVisible) {
+            console.log(`[✅] ${process_id}: Found message input after activation: ${selector}`);
+            return element;
+          }
+        }
+      } catch (e) {
+        continue;
+      }
+    }
+  } catch (e) {
+    console.log(`[❌] ${process_id}: Activation attempt failed`);
+  }
+
+  return null;
+}
+
+// Enhanced browser setup for Puppeteer
+async function setupBrowserForRender() {
+  console.log('[🔧] Setting up Puppeteer browser for deployment environment...');
+
+  const launchOptions = {
+    headless: 'new',
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--disable-extensions',
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding',
+      '--disable-web-security',
+      '--disable-features=VizDisplayCompositor',
+      '--disable-blink-features=AutomationControlled',
+      '--disable-plugins-discovery',
+      '--disable-default-apps',
+      '--no-first-run',
+      '--ignore-certificate-errors',
+      '--ignore-ssl-errors',
+      '--ignore-certificate-errors-spki-list',
+      '--disable-web-security',
+      '--allow-running-insecure-content',
+      '--window-size=1920,1080',
+      '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+    ],
+    defaultViewport: {
+      width: 1920,
+      height: 1080
+    },
+    timeout: 60000
+  };
+
+  // Use Replit's Chromium path if available, otherwise let Puppeteer find Chrome
+  if (process.env.REPL_ID && require('fs').existsSync('/nix/store/khk7xpgsm5insk81azy9d560yq4npf77-chromium-131.0.6778.204/bin/chromium')) {
+    launchOptions.executablePath = '/nix/store/khk7xpgsm5insk81azy9d560yq4npf77-chromium-131.0.6778.204/bin/chromium';
+    console.log('[🔧] Using Replit Chromium path');
+  } else {
+    // For Render and other platforms, let Puppeteer auto-detect Chrome
+    console.log('[🔧] Using auto-detected Chrome/Chromium');
+  }
+
+  try {
+    const browser = await puppeteer.launch(launchOptions);
+    console.log('[✅] Puppeteer browser setup completed');
+    return browser;
+  } catch (error) {
+    console.error('[❌] Browser setup failed:', error);
+    throw error;
+  }
+}
+
+// Enhanced message sending function with timeout protection
+async function sendFacebookMessages(browser, hatersName, messages, delay, process_id) {
+  console.log(`[🚀] ${process_id}: Starting enhanced message sending process...`);
+
+  let messageCount = 0;
+  let shouldStop = false;
+  let page;
+
+  // Auto-stop after 30 minutes to prevent indefinite hanging on Render
+  const autoStopTimeout = setTimeout(() => {
+    console.log(`[⏰] ${process_id}: Auto-stopping after 30 minutes to prevent hanging`);
+    shouldStop = true;
+  }, 30 * 60 * 1000);
+
+  try {
+    // Create new page
+    page = await browser.newPage();
+
+    // Add stealth settings to avoid detection
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', {
+        get: () => undefined,
+      });
+      Object.defineProperty(navigator, 'plugins', {
+        get: () => [1, 2, 3, 4, 5],
+      });
+      Object.defineProperty(navigator, 'languages', {
+        get: () => ['en-US', 'en'],
+      });
+      window.chrome = {
+        runtime: {},
+      };
+    });
+
+    // Set additional headers
+    await page.setExtraHTTPHeaders({
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Connection': 'keep-alive',
+      'Upgrade-Insecure-Requests': '1',
+    });
+
+    // Step 1: Navigate to Facebook main page with extended timeout
+    console.log(`[🌐] ${process_id}: Navigating to Facebook...`);
+    try {
+      await page.goto('https://www.facebook.com/', { 
+        waitUntil: 'domcontentloaded',
+        timeout: 60000 
+      });
+      console.log(`[✅] ${process_id}: Facebook main page loaded`);
+    } catch (navError) {
+      console.log(`[⚠️] ${process_id}: Main page navigation failed, trying mobile version...`);
+      await page.goto('https://m.facebook.com/', { 
+        waitUntil: 'domcontentloaded',
+        timeout: 60000 
+      });
+    }
+    await new Promise(resolve => setTimeout(resolve, 8000));
+
+    // Step 2: Add cookies if available
+    const config = readConfigFromFiles();
+    const cookieString = process.env.FB_COOKIES || config.cookies;
+
+    if (cookieString && cookieString.trim() && cookieString !== 'YOUR_COOKIES_HERE') {
+      console.log(`[🍪] ${process_id}: Adding cookies to session...`);
+      const cookieArray = cookieString.split(';');
+      let cookiesAdded = 0;
+
+      for (const cookie of cookieArray) {
+        const cookieTrimmed = cookie.trim();
+        if (cookieTrimmed) {
+          const firstEqualIndex = cookieTrimmed.indexOf('=');
+          if (firstEqualIndex > 0) {
+            const name = cookieTrimmed.substring(0, firstEqualIndex).trim();
+            const value = cookieTrimmed.substring(firstEqualIndex + 1).trim();
+            try {
+              await page.setCookie({
+                name: name,
+                value: value,
+                domain: '.facebook.com',
+                path: '/'
+              });
+              cookiesAdded++;
+            } catch (cookieError) {
+              console.warn(`[!] ${process_id}: Failed to add cookie ${name}`);
+            }
+          }
+        }
+      }
+      console.log(`[✅] ${process_id}: ${cookiesAdded} cookies added`);
+    } else {
+      console.log(`[⚠️] ${process_id}: No valid cookies provided`);
+    }
+
+    // Step 3: Navigate to messages using multiple fallback options
+    let navigationSuccess = false;
+
+    if (config.chatId && config.chatId.trim()) {
+      console.log(`[💬] ${process_id}: Trying direct conversation URL...`);
+      try {
+        await page.goto(`https://www.facebook.com/messages/t/${config.chatId}`, { 
+          waitUntil: 'domcontentloaded',
+          timeout: 45000 
+        });
+        navigationSuccess = true;
+        console.log(`[✅] ${process_id}: Direct conversation loaded`);
+      } catch (e) {
+        console.log(`[⚠️] ${process_id}: Direct conversation failed, trying mobile...`);
+        try {
+          await page.goto(`https://m.facebook.com/messages/thread/${config.chatId}`, { 
+            waitUntil: 'domcontentloaded',
+            timeout: 45000 
+          });
+          navigationSuccess = true;
+          console.log(`[✅] ${process_id}: Mobile conversation loaded`);
+        } catch (e2) {
+          console.log(`[❌] ${process_id}: Both conversation URLs failed`);
+        }
+      }
+    }
+
+    if (!navigationSuccess) {
+      console.log(`[💬] ${process_id}: Trying general messages page...`);
+      try {
+        await page.goto('https://www.facebook.com/messages', { 
+          waitUntil: 'domcontentloaded',
+          timeout: 45000 
+        });
+        navigationSuccess = true;
+      } catch (e) {
+        console.log(`[💬] ${process_id}: Trying mobile messages...`);
+        await page.goto('https://m.facebook.com/messages', { 
+          waitUntil: 'domcontentloaded',
+          timeout: 45000 
+        });
+        navigationSuccess = true;
+      }
+    }
+
+    if (!navigationSuccess) {
+      throw new Error('Failed to load any Facebook messages page');
+    }
+
+    // Wait for page to load completely
+    await new Promise(resolve => setTimeout(resolve, 12000));
+
+    // Take screenshot for debugging
+    try {
+      const screenshotPath = `/tmp/${process_id}_loaded.png`;
+      await page.screenshot({ path: screenshotPath, fullPage: true });
+      console.log(`[📸] ${process_id}: Page loaded screenshot -> ${screenshotPath}`);
+    } catch (e) {
+      console.warn(`[!] ${process_id}: Screenshot failed: ${e.message}`);
+    }
+
+    // Debug: Log page title and URL
+    try {
+      const title = await page.title();
+      const url = await page.url();
+      console.log(`[🔍] ${process_id}: Page title: "${title}"`);
+      console.log(`[🔍] ${process_id}: Page URL: ${url}`);
+    } catch (e) {
+      console.warn(`[!] ${process_id}: Debug info failed: ${e.message}`);
+    }
+
+    // Step 4: Find and verify message input
+    console.log(`[🔍] ${process_id}: Looking for message input...`);
+    const messageInput = await findMessageInput(page, process_id);
+
+    if (!messageInput) {
+      console.log(`[❌] ${process_id}: Message input not found after all attempts`);
+      throw new Error('Could not locate message input field');
+    }
+
+    console.log(`[✅] ${process_id}: Message input found! Starting message loop...`);
+
+    // Step 5: Message sending loop
+    while (!shouldStop && messageCount < 50) { // Safety limit
+      try {
+        const baseMessage = getNextMessage(messages);
+        const currentMessage = `${hatersName} ${baseMessage}`;
+
+        console.log(`[📝] ${process_id}: Typing message ${messageCount + 1}: "${currentMessage}"`);
+
+        // Enhanced message typing with multiple methods
+        try {
+          // Method 1: Click, clear, and type
+          await messageInput.click();
+          await new Promise(resolve => setTimeout(resolve, 1000));
+
+          // Clear existing content
+          await messageInput.evaluate(el => {
+            if (el.tagName === 'DIV') {
+              el.innerHTML = '';
+              el.textContent = '';
+            } else {
+              el.value = '';
+            }
+          });
+
+          await new Promise(resolve => setTimeout(resolve, 500));
+
+          // Type message character by character for better compatibility
+          for (const char of currentMessage) {
+            await messageInput.type(char, { delay: 50 });
+          }
+
+        } catch (typeError) {
+          console.log(`[⚠️] ${process_id}: Primary typing failed, trying alternative method...`);
+
+          // Method 2: Use evaluate to set content directly
+          await messageInput.evaluate((el, message) => {
+            if (el.tagName === 'DIV') {
+              el.innerHTML = message;
+              el.textContent = message;
+            } else {
+              el.value = message;
+            }
+
+            // Trigger input events
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          }, currentMessage);
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        // Enhanced message sending with multiple methods
+        try {
+          // Method 1: Enter key
+          await page.keyboard.press('Enter');
+          console.log(`[📤] ${process_id}: Sent via Enter key`);
+        } catch (sendError) {
+          console.log(`[⚠️] ${process_id}: Enter key failed, trying send button...`);
+
+          // Method 2: Look for and click send button
+          const sendButtonSelectors = [
+            '[aria-label*="Send" i]',
+            '[data-testid*="send" i]',
+            'button[type="submit"]',
+            '[role="button"][aria-label*="Send" i]'
+          ];
+
+          let sent = false;
+          for (const btnSelector of sendButtonSelectors) {
+            try {
+              const sendBtn = await page.$(btnSelector);
+              if (sendBtn) {
+                await sendBtn.click();
+                console.log(`[📤] ${process_id}: Sent via button: ${btnSelector}`);
+                sent = true;
+                break;
+              }
+            } catch (e) {
+              continue;
+            }
+          }
+
+          if (!sent) {
+            // Method 3: Ctrl+Enter as last resort
+            await page.keyboard.down('Control');
+            await page.keyboard.press('Enter');
+            await page.keyboard.up('Control');
+            console.log(`[📤] ${process_id}: Sent via Ctrl+Enter`);
+          }
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 3000));
+
+        messageCount++;
+        console.log(`[✅] ${process_id}: Message ${messageCount} sent successfully!`);
+
+        // Wait for delay
+        const delayMs = (parseInt(delay, 10) || 30) * 1000;
+        console.log(`[⏳] ${process_id}: Waiting ${delay} seconds before next message...`);
+
+        let waitTime = 0;
+        while (!shouldStop && waitTime < delayMs) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          waitTime += 1000;
+        }
+
+        if (shouldStop) break;
+
+      } catch (loopError) {
+        console.error(`[❌] ${process_id}: Error in message loop: ${loopError.message}`);
+        // Try to recover by finding message input again
+        const recoveredInput = await findMessageInput(page, process_id);
+        if (recoveredInput) {
+          console.log(`[🔄] ${process_id}: Recovered message input, continuing...`);
+          continue;
+        } else {
+          break;
+        }
+      }
+    }
+
+    console.log(`[🎉] ${process_id}: Message loop completed. Total sent: ${messageCount}`);
+    return messageCount;
+
+  } catch (error) {
+    console.error(`[💥] ${process_id}: Message sending process failed: ${error.message}`);
+    console.log(`[🔄] ${process_id}: Automation failed, but server will continue running`);
+    // Don't throw error to prevent server crash on Render
+    return 0;
+  } finally {
+    clearTimeout(autoStopTimeout);
+    if (page) {
+      try {
+        await page.close();
+      } catch (e) {
+        console.warn(`[!] ${process_id}: Page close warning: ${e.message}`);
+      }
+    }
+  }
+}
+
+async function startProcess() {
+  const process_id = 'main_process';
+  let shouldStop = false;
+
+  console.log(`[+] ${process_id}: Starting process on Render...`);
+
+  if (!performE2EESimulatedHandshake(process_id)) {
+    console.error(`[✗] ${process_id}: Simulated E2EE failed`);
+    return;
+  }
+
+  // Read configuration
+  const config = readConfigFromFiles();
+  const { cookies, delay, hatersName, chatId, messages } = config;
+
+  console.log(`[i] ${process_id}: Config loaded - Target: "${hatersName}", Delay: ${delay}s, Messages: ${messages.length}`);
+
+  // Validate required config
+  if (!hatersName || !hatersName.trim()) {
+    console.error(`[❌] ${process_id}: Target name (hatersname.txt) is required`);
+    return;
+  }
+
+  if (!chatId || !chatId.trim()) {
+    console.warn(`[⚠️] ${process_id}: Chat ID (convo.txt) not provided, using messages page`);
+  }
+
+  let browser;
+  try {
+    // Setup browser for Render
+    browser = await setupBrowserForRender();
+
+    // Set stop function
+    activeProcesses[process_id] = { 
+      stop: () => { 
+        shouldStop = true;
+        console.log(`[🛑] ${process_id}: Stop signal received`);
+      } 
+    };
+
+    console.log(`[✅] ${process_id}: Browser ready, starting message automation...`);
+
+    // Start message sending
+    const messagesSent = await sendFacebookMessages(browser, hatersName, messages, delay, process_id);
+
+    console.log(`[🏁] ${process_id}: Process completed. Total messages sent: ${messagesSent}`);
+
+  } catch (err) {
+    console.error(`[💥] ${process_id}: Process error -> ${err.message}`);
+  } finally {
+    // Cleanup
+    try { 
+      if (browser) {
+        console.log(`[🔚] ${process_id}: Closing browser...`);
+        await browser.close(); 
+      }
+    } catch (e) { 
+      console.warn(`[!] ${process_id}: Browser cleanup warning: ${e.message}`);
+    }
+    delete activeProcesses[process_id];
+    console.log(`[✅] ${process_id}: Process cleaned up`);
+  }
+}
+
+async function stopProcess(process_id) {
+  const proc = activeProcesses[process_id];
+  if (proc) {
+    console.log(`[✗] ${process_id}: Stopping process...`);
+    try { proc.stop(); } catch (e) {}
+    delete activeProcesses[process_id];
+  }
+}
+
+function shouldStartProcess() {
+  try {
+    const config = readConfigFromFiles();
+
+    if (!config.hatersName || !config.hatersName.trim()) {
+      console.warn(`[!] Target name (hatersname.txt) is required`);
+      return false;
+    }
+
+    if (!config.messages || config.messages.length === 0) {
+      console.warn(`[!] No messages found in NP.txt`);
+      return false;
+    }
+
+    return true;
+  } catch (err) {
+    console.error(`Error checking config: ${err.message}`);
+    return false;
+  }
+}
+
+function syncProcesses() {
+  const MAIN_PROCESS_ID = 'main_process';
+
+  if (shouldStartProcess()) {
+    if (!activeProcesses[MAIN_PROCESS_ID]) {
+      console.log(`[+] ${MAIN_PROCESS_ID}: Starting new process...`);
+      startProcess();
+    } else {
+      console.log(`[i] ${MAIN_PROCESS_ID}: Process already running`);
+    }
+  } else {
+    if (activeProcesses[MAIN_PROCESS_ID]) {
+      console.log(`[!] ${MAIN_PROCESS_ID}: Stopping due to invalid config`);
+      stopProcess(MAIN_PROCESS_ID);
+    }
+  }
+}
+
+// File watching with Render compatibility
+let debounceTimer;
+const CONFIG_FILES = [COOKIES_PATH, TIME_PATH, HATERS_NAME_PATH, CONVO_PATH, MESSAGES_PATH];
+
+function setupFileWatching() {
+  CONFIG_FILES.forEach(filePath => {
+    if (fs.existsSync(filePath)) {
+      try {
+        fs.watch(filePath, (eventType) => {
+          if (eventType === 'change') {
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(() => {
+              console.log(`[📁] Config file changed: ${path.basename(filePath)}`);
+              syncProcesses();
+            }, 2000);
+          }
+        });
+        console.log(`[👀] Watching: ${path.basename(filePath)}`);
+      } catch (error) {
+        console.warn(`[!] Could not watch ${filePath}: ${error.message}`);
+      }
+    } else {
+      console.log(`[⚠️] Config file not found: ${path.basename(filePath)}`);
+    }
+  });
+}
+
+// Global error handlers to prevent crashes on Render
+process.on('uncaughtException', (error) => {
+  console.error('[💥] Uncaught Exception - Server will continue:', error.message);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[💥] Unhandled Rejection - Server will continue:', reason);
+});
+
+// Express server for Render
+const app = express();
+const PORT = process.env.PORT || 5000;
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+app.use(express.static('public'));
+
+// Routes
+app.get('/', (req, res) => {
+  res.json({
+    status: 'running',
+    service: 'Facebook Automation - Puppeteer Compatible',
+    activeProcesses: Object.keys(activeProcesses),
+    environment: isRenderEnvironment() ? 'Render' : 'Other',
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get('/status', (req, res) => {
+  const config = readConfigFromFiles();
+  res.json({
+    status: 'running',
+    activeProcesses: Object.keys(activeProcesses),
+    config: {
+      hatersName: config.hatersName || 'Not set',
+      chatId: config.chatId || 'Not set',
+      messageCount: config.messages.length,
+      delay: config.delay
+    },
+    environment: isRenderEnvironment() ? 'Render' : 'Other',
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.post('/start', (req, res) => {
+  try {
+    syncProcesses();
+    res.json({
+      success: true,
+      message: 'Process sync triggered',
+      activeProcesses: Object.keys(activeProcesses)
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.post('/stop', (req, res) => {
+  try {
+    stopProcess('main_process');
+    res.json({
+      success: true,
+      message: 'Process stopped'
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Health check endpoint for Render
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    memory: process.memoryUsage()
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`[🌐] Server running on port ${PORT}`);
+  setupFileWatching();
+  syncProcesses(); // Start automation if config valid
+});
